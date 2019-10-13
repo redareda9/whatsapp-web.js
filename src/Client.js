@@ -156,7 +156,7 @@ class Client extends EventEmitter {
    * @param {string} message
    */
   async sendMessageToPhone(phoneNumber, message) {
-    await this.pupPage.goto('whatsapp://send?phone=' + phoneNumber + '&text=' + message);
+    await this.pupPage.goto('https://web.whatsapp.com/send?phone=' + phoneNumber + '&text=' + message);
     await this.pupPage.waitForSelector('#startup');
     await this.pupPage.waitForFunction(() => !document.querySelector('#startup'));
     await this.pupPage
