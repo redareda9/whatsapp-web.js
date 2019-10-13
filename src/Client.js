@@ -16,157 +16,180 @@ const Message = require('./structures/Message');
  * @extends {EventEmitter}
  */
 class Client extends EventEmitter {
-    constructor(options = {}) {
-        super();
+  constructor(options = {}) {
+    super();
 
-        this.options = Util.mergeDefault(DefaultOptions, options);
+    this.options = Util.mergeDefault(DefaultOptions, options);
 
-        this.pupBrowser = null;
-        this.pupPage = null;
+    this.pupBrowser = null;
+    this.pupPage = null;
+  }
+
+  /**
+   * Sets up events and requirements, kicks off authentication request
+   */
+  async initialize() {
+    const browser = await puppeteer.launch(this.options.puppeteer);
+    const page = await browser.newPage();
+    page.setUserAgent(UserAgent);
+
+    if (this.options.session) {
+      await page.evaluateOnNewDocument(session => {
+        localStorage.clear();
+        localStorage.setItem('WABrowserId', session.WABrowserId);
+        localStorage.setItem('WASecretBundle', session.WASecretBundle);
+        localStorage.setItem('WAToken1', session.WAToken1);
+        localStorage.setItem('WAToken2', session.WAToken2);
+      }, this.options.session);
     }
 
-    /**
-     * Sets up events and requirements, kicks off authentication request
-     */
-    async initialize() {
-        const browser = await puppeteer.launch(this.options.puppeteer);
-        const page = await browser.newPage();
-        page.setUserAgent(UserAgent);
+    await page.goto(WhatsWebURL);
 
-        if (this.options.session) {
-            await page.evaluateOnNewDocument(
-                session => {
-                    localStorage.clear();
-                    localStorage.setItem("WABrowserId", session.WABrowserId);
-                    localStorage.setItem("WASecretBundle", session.WASecretBundle);
-                    localStorage.setItem("WAToken1", session.WAToken1);
-                    localStorage.setItem("WAToken2", session.WAToken2);
-                }, this.options.session);
+    const KEEP_PHONE_CONNECTED_IMG_SELECTOR = '._1wSzK';
+
+    if (this.options.session) {
+      // Check if session restore was successfull
+      try {
+        await page.waitForSelector(KEEP_PHONE_CONNECTED_IMG_SELECTOR, { timeout: 5000 });
+      } catch (err) {
+        if (err.name === 'TimeoutError') {
+          this.emit(Events.AUTHENTICATION_FAILURE, 'Unable to log in. Are the session details valid?');
+          browser.close();
+
+          return;
         }
 
-        await page.goto(WhatsWebURL);
+        throw err;
+      }
+    } else {
+      // Wait for QR Code
+      const QR_CONTAINER_SELECTOR = '._2d3Jz';
+      const QR_VALUE_SELECTOR = '._1pw2F';
 
-        const KEEP_PHONE_CONNECTED_IMG_SELECTOR = '._1wSzK';
+      await page.waitForSelector(QR_CONTAINER_SELECTOR);
 
-        if (this.options.session) {
-            // Check if session restore was successfull 
-            try {
-                await page.waitForSelector(KEEP_PHONE_CONNECTED_IMG_SELECTOR, { timeout: 5000 });
-            } catch (err) {
-                if (err.name === 'TimeoutError') {
-                    this.emit(Events.AUTHENTICATION_FAILURE, 'Unable to log in. Are the session details valid?');
-                    browser.close();
+      const qr = await page.$eval(QR_VALUE_SELECTOR, node => node.getAttribute('data-ref'));
+      this.emit(Events.QR_RECEIVED, qr);
 
-                    return;
-                }
-
-                throw err;
-            }
-
-        } else {
-            // Wait for QR Code
-            const QR_CONTAINER_SELECTOR = '._2d3Jz';
-            const QR_VALUE_SELECTOR = '._1pw2F';
-
-            await page.waitForSelector(QR_CONTAINER_SELECTOR);
-
-            const qr = await page.$eval(QR_VALUE_SELECTOR, node => node.getAttribute('data-ref'));
-            this.emit(Events.QR_RECEIVED, qr);
-
-            // Wait for code scan
-            await page.waitForSelector(KEEP_PHONE_CONNECTED_IMG_SELECTOR, { timeout: 0 });
-        }
-
-        await page.evaluate(ExposeStore, moduleRaid.toString());
-
-        // Get session tokens
-        const localStorage = JSON.parse(await page.evaluate(() => {
-            return JSON.stringify(window.localStorage);
-        }));
-
-        const session = {
-            WABrowserId: localStorage.WABrowserId,
-            WASecretBundle: localStorage.WASecretBundle,
-            WAToken1: localStorage.WAToken1,
-            WAToken2: localStorage.WAToken2
-        }
-
-        this.emit(Events.AUTHENTICATED, session);
-
-        // Check Store Injection
-        await page.waitForFunction('window.Store != undefined');
-
-        //Load custom serializers
-        await page.evaluate(LoadCustomSerializers);
-
-        // Register events
-        await page.exposeFunction('onAddMessageEvent', msg => {
-            if (!msg.isNewMsg) return;
-
-            const message = new Message(this, msg);
-            this.emit(Events.MESSAGE_CREATE, message);
-
-            if (msg.id.fromMe) return;
-            this.emit(Events.MESSAGE_RECEIVED, message);
-        });
-
-        await page.exposeFunction('onAppStateChangedEvent', (AppState, state) => {
-            const ACCEPTED_STATES = [WAState.CONNECTED, WAState.OPENING, WAState.PAIRING];
-            if (!ACCEPTED_STATES.includes(state)) {
-                this.emit(Events.DISCONNECTED);
-                this.destroy();
-            }
-        })
-
-        await page.evaluate(() => {
-            Store.Msg.on('add', onAddMessageEvent);
-            Store.AppState.on('change:state', onAppStateChangedEvent);
-        }).catch(err => console.log(err.message));
-
-        this.pupBrowser = browser;
-        this.pupPage = page;
-
-        this.emit(Events.READY);
+      // Wait for code scan
+      await page.waitForSelector(KEEP_PHONE_CONNECTED_IMG_SELECTOR, { timeout: 0 });
     }
 
-    async destroy() {
-        await this.pupBrowser.close();
-    }
+    await page.evaluate(ExposeStore, moduleRaid.toString());
 
-    /**
-     * Send a message to a specific chatId
-     * @param {string} chatId
-     * @param {string} message 
-     */
-    async sendMessage(chatId, message) {
-        await this.pupPage.evaluate((chatId, message) => {
-            Store.SendMessage(Store.Chat.get(chatId), message);
-        }, chatId, message)
-    }
+    // Get session tokens
+    const localStorage = JSON.parse(
+      await page.evaluate(() => {
+        return JSON.stringify(window.localStorage);
+      })
+    );
 
-    /**
-     * Get all current chat instances
-     */
-    async getChats() {
-        let chats = await this.pupPage.evaluate(() => {
-            return WWebJS.getChats();
-        });
+    const session = {
+      WABrowserId: localStorage.WABrowserId,
+      WASecretBundle: localStorage.WASecretBundle,
+      WAToken1: localStorage.WAToken1,
+      WAToken2: localStorage.WAToken2
+    };
 
-        return chats.map(chat => ChatFactory.create(this, chat));
-    }
+    this.emit(Events.AUTHENTICATED, session);
 
-    /**
-     * Get chat instance by ID
-     * @param {string} chatId 
-     */
-    async getChatById(chatId) {
-        let chat = await this.pupPage.evaluate(chatId => {
-            return WWebJS.getChat(chatId);
-        }, chatId);
+    // Check Store Injection
+    await page.waitForFunction('window.Store != undefined');
 
-        return ChatFactory.create(this, chat);
-    }
+    //Load custom serializers
+    await page.evaluate(LoadCustomSerializers);
 
+    // Register events
+    await page.exposeFunction('onAddMessageEvent', msg => {
+      if (!msg.isNewMsg) return;
+
+      const message = new Message(this, msg);
+      this.emit(Events.MESSAGE_CREATE, message);
+
+      if (msg.id.fromMe) return;
+      this.emit(Events.MESSAGE_RECEIVED, message);
+    });
+
+    await page.exposeFunction('onAppStateChangedEvent', (AppState, state) => {
+      const ACCEPTED_STATES = [WAState.CONNECTED, WAState.OPENING, WAState.PAIRING];
+      if (!ACCEPTED_STATES.includes(state)) {
+        this.emit(Events.DISCONNECTED);
+        this.destroy();
+      }
+    });
+
+    await page
+      .evaluate(() => {
+        Store.Msg.on('add', onAddMessageEvent);
+        Store.AppState.on('change:state', onAppStateChangedEvent);
+      })
+      .catch(err => console.log(err.message));
+
+    this.pupBrowser = browser;
+    this.pupPage = page;
+
+    this.emit(Events.READY);
+  }
+
+  async destroy() {
+    await this.pupBrowser.close();
+  }
+
+  /**
+   * Send a message to a specific chatId
+   * @param {string} chatId
+   * @param {string} message
+   */
+  async sendMessage(chatId, message) {
+    await this.pupPage.evaluate(
+      (chatId, message) => {
+        Store.SendMessage(Store.Chat.get(chatId), message);
+      },
+      chatId,
+      message
+    );
+  }
+
+  /**
+   * Send a message to a specific phoneNumber
+   * @param {string} phoneNumber
+   * @param {string} message
+   */
+  async sendMessageToPhone(phoneNumber, message) {
+    await this.pupPage.goto('whatsapp://send?phone=' + phoneNumber + '&text=' + message);
+    await this.pupPage.waitForSelector('#startup');
+    await this.pupPage.waitForFunction(() => !document.querySelector('#startup'));
+    await this.pupPage
+      .waitForSelector('button._3M-N-', { timeout: 3000 })
+      .catch(() => console.log("Element doesn't exist!"));
+    await this.pupPage.evaluate(() => {
+      document.querySelector('button._3M-N-').click();
+      console.log(document.querySelector('button._3M-N-'));
+    });
+  }
+
+  /**
+   * Get all current chat instances
+   */
+  async getChats() {
+    let chats = await this.pupPage.evaluate(() => {
+      return WWebJS.getChats();
+    });
+
+    return chats.map(chat => ChatFactory.create(this, chat));
+  }
+
+  /**
+   * Get chat instance by ID
+   * @param {string} chatId
+   */
+  async getChatById(chatId) {
+    let chat = await this.pupPage.evaluate(chatId => {
+      return WWebJS.getChat(chatId);
+    }, chatId);
+
+    return ChatFactory.create(this, chat);
+  }
 }
 
 module.exports = Client;
